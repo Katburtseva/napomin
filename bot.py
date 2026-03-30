@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
@@ -25,6 +26,34 @@ def get_env(name: str, default: str | None = None) -> str | None:
 
 def build_webhook_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def build_application(token: str) -> Application:
+    application = Application.builder().token(token).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("remind", remind))
+    return application
+
+
+def create_stop_event() -> asyncio.Event:
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def request_stop() -> None:
+        logger.info("Shutdown signal received")
+        stop_event.set()
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, request_stop)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_args: stop_event.set())
+
+    return stop_event
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -109,36 +138,36 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def main() -> None:
-    token = get_env("TELEGRAM_BOT_TOKEN") or "8772042846:AAEpJQXSSVHnQrIZhloxrZKOj2MU847o4YI"
-    if not token:
-        raise RuntimeError(
-            "Не найден TELEGRAM_BOT_TOKEN. "
-            "Добавь токен в переменные окружения Render или в код."
-        )
+async def run_polling(application: Application) -> None:
+    logger.info("Bot is running in polling mode")
+    stop_event = create_stop_event()
 
-    port = int(get_env("PORT", "10000"))
-    webhook_path = get_env("TELEGRAM_WEBHOOK_PATH", "telegram")
-    webhook_base_url = get_env("WEBHOOK_URL") or get_env("RENDER_EXTERNAL_URL")
-    secret_token = get_env("TELEGRAM_SECRET_TOKEN") or token
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
 
-    if not webhook_base_url:
-        raise RuntimeError(
-            "Не найден WEBHOOK_URL или RENDER_EXTERNAL_URL. "
-            "Для Render Web Service нужен внешний HTTPS-адрес сервиса."
-        )
+    try:
+        await stop_event.wait()
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
-    webhook_url = build_webhook_url(webhook_base_url, webhook_path)
 
-    application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("remind", remind))
-
+async def run_webhook(
+    application: Application,
+    port: int,
+    webhook_path: str,
+    webhook_url: str,
+    secret_token: str | None,
+) -> None:
     logger.info("Bot is running in webhook mode on port %s", port)
     logger.info("Webhook URL: %s", webhook_url)
+    stop_event = create_stop_event()
 
-    application.run_webhook(
+    await application.initialize()
+    await application.start()
+    await application.updater.start_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=webhook_path,
@@ -147,6 +176,35 @@ def main() -> None:
         drop_pending_updates=True,
     )
 
+    try:
+        await stop_event.wait()
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
+
+async def main() -> None:
+    token = get_env("TELEGRAM_BOT_TOKEN") or "8772042846:AAEpJQXSSVHnQrIZhloxrZKOj2MU847o4YI"
+    if not token:
+        raise RuntimeError(
+            "Не найден TELEGRAM_BOT_TOKEN. "
+            "Добавь токен в переменные окружения Render или в код."
+        )
+
+    application = build_application(token)
+
+    webhook_base_url = get_env("WEBHOOK_URL") or get_env("RENDER_EXTERNAL_URL")
+    if webhook_base_url:
+        port = int(get_env("PORT", "10000"))
+        webhook_path = get_env("TELEGRAM_WEBHOOK_PATH", "telegram")
+        secret_token = get_env("TELEGRAM_SECRET_TOKEN") or token
+        webhook_url = build_webhook_url(webhook_base_url, webhook_path)
+        await run_webhook(application, port, webhook_path, webhook_url, secret_token)
+        return
+
+    await run_polling(application)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
