@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import signal
 from datetime import datetime, timedelta, timezone
 
@@ -26,6 +27,15 @@ def get_env(name: str, default: str | None = None) -> str | None:
 
 def build_webhook_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def build_safe_secret_token(raw_value: str | None, token: str) -> str:
+    candidate = raw_value or f"telegram-bot-{token.split(':', 1)[0]}"
+    sanitized = re.sub(r"[^A-Za-z0-9_-]", "-", candidate)
+    sanitized = sanitized.strip("-_")
+    if not sanitized:
+        sanitized = "telegram-bot-secret"
+    return sanitized[:256]
 
 
 def build_application(token: str) -> Application:
@@ -198,7 +208,7 @@ async def main() -> None:
     if webhook_base_url:
         port = int(get_env("PORT", "10000"))
         webhook_path = get_env("TELEGRAM_WEBHOOK_PATH", "telegram")
-        secret_token = get_env("TELEGRAM_SECRET_TOKEN") or token
+        secret_token = build_safe_secret_token(get_env("TELEGRAM_SECRET_TOKEN"), token)
         webhook_url = build_webhook_url(webhook_base_url, webhook_path)
         await run_webhook(application, port, webhook_path, webhook_url, secret_token)
         return
