@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: telegram-reminder-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_PATH
+        value: telegram
+      - key: TELEGRAM_SECRET_TOKEN
+        generateValue: true
