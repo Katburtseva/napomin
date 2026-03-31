@@ -76,6 +76,24 @@ def get_sorted_reminders(application: Application, chat_id: int) -> list[Reminde
     return sorted(reminders, key=lambda item: item.remind_at)
 
 
+def remove_reminder_if_current_task(
+    application: Application,
+    chat_id: int,
+    reminder_id: int,
+) -> None:
+    reminders = reminders_store(application).get(chat_id)
+    if not reminders:
+        return
+
+    reminder = reminders.get(reminder_id)
+    if reminder is None or reminder.task is not asyncio.current_task():
+        return
+
+    reminders.pop(reminder_id, None)
+    if not reminders:
+        reminders_store(application).pop(chat_id, None)
+
+
 def build_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
@@ -250,7 +268,7 @@ async def schedule_delivery(
     except Exception:
         logger.exception("Failed to deliver reminder %s for chat %s", reminder_id, chat_id)
     finally:
-        remove_reminder(application, chat_id, reminder_id)
+        remove_reminder_if_current_task(application, chat_id, reminder_id)
 
 
 async def create_reminder(
@@ -422,7 +440,6 @@ async def run_application(
 ) -> None:
     stop_event = create_stop_event()
     await application.initialize()
-    await application.start()
 
     if webhook_base_url:
         webhook_url = build_webhook_url(webhook_base_url, webhook_path)
@@ -439,6 +456,8 @@ async def run_application(
     else:
         logger.info("Bot is running in polling mode")
         await application.updater.start_polling(drop_pending_updates=True)
+
+    await application.start()
 
     try:
         await stop_event.wait()
