@@ -4,7 +4,7 @@ import os
 import re
 import signal
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -15,16 +15,17 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
 MSK = timezone(timedelta(hours=3), name="MSK")
 MAX_REMINDER_TEXT_LENGTH = 280
-REMINDERS_KEY = "reminders"
-REMINDER_COUNTER_KEY = "reminder_counter"
 DEFAULT_BOT_TOKEN = "8772042846:AAEpJQXSSVHnQrIZhloxrZKOj2MU847o4YI"
 CALLBACK_CANCEL_PREFIX = "cancel:"
+REMINDERS_KEY = "reminders"
+COUNTER_KEY = "reminder_counter"
 
 
 @dataclass(slots=True)
-class ReminderRecord:
+class Reminder:
     reminder_id: int
     chat_id: int
     text: str
@@ -41,51 +42,38 @@ def get_env(name: str, default: str | None = None) -> str | None:
     return value or None
 
 
-def build_webhook_url(base_url: str, path: str) -> str:
-    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
-
-
-def build_safe_secret_token(raw_value: str | None, token: str) -> str:
-    candidate = raw_value or f"telegram-bot-{token.split(':', 1)[0]}"
-    sanitized = re.sub(r"[^A-Za-z0-9_-]", "-", candidate)
-    sanitized = sanitized.strip("-_")
-    if not sanitized:
-        sanitized = "telegram-bot-secret"
-    return sanitized[:256]
-
-
-def get_reminder_store(application: Application) -> dict[int, dict[int, ReminderRecord]]:
+def reminders_store(application: Application) -> dict[int, dict[int, Reminder]]:
     return application.bot_data.setdefault(REMINDERS_KEY, {})
 
 
+def chat_reminders(application: Application, chat_id: int) -> dict[int, Reminder]:
+    return reminders_store(application).setdefault(chat_id, {})
+
+
 def next_reminder_id(application: Application) -> int:
-    current = int(application.bot_data.get(REMINDER_COUNTER_KEY, 0)) + 1
-    application.bot_data[REMINDER_COUNTER_KEY] = current
-    return current
+    reminder_id = int(application.bot_data.get(COUNTER_KEY, 0)) + 1
+    application.bot_data[COUNTER_KEY] = reminder_id
+    return reminder_id
 
 
-def register_reminder(application: Application, reminder: ReminderRecord) -> None:
-    store = get_reminder_store(application)
-    chat_reminders = store.setdefault(reminder.chat_id, {})
-    chat_reminders[reminder.reminder_id] = reminder
+def save_reminder(application: Application, reminder: Reminder) -> None:
+    chat_reminders(application, reminder.chat_id)[reminder.reminder_id] = reminder
 
 
-def pop_reminder(application: Application, chat_id: int, reminder_id: int) -> ReminderRecord | None:
-    store = get_reminder_store(application)
-    chat_reminders = store.get(chat_id)
-    if not chat_reminders:
+def remove_reminder(application: Application, chat_id: int, reminder_id: int) -> Reminder | None:
+    reminders = reminders_store(application).get(chat_id)
+    if not reminders:
         return None
 
-    reminder = chat_reminders.pop(reminder_id, None)
-    if not chat_reminders:
-        store.pop(chat_id, None)
+    reminder = reminders.pop(reminder_id, None)
+    if not reminders:
+        reminders_store(application).pop(chat_id, None)
     return reminder
 
 
-def list_reminders(application: Application, chat_id: int) -> list[ReminderRecord]:
-    store = get_reminder_store(application)
-    chat_reminders = store.get(chat_id, {})
-    return sorted(chat_reminders.values(), key=lambda item: item.remind_at)
+def get_sorted_reminders(application: Application, chat_id: int) -> list[Reminder]:
+    reminders = reminders_store(application).get(chat_id, {}).values()
+    return sorted(reminders, key=lambda item: item.remind_at)
 
 
 def build_main_keyboard() -> ReplyKeyboardMarkup:
@@ -100,11 +88,11 @@ def build_main_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def build_cancel_keyboard(reminders: list[ReminderRecord]) -> InlineKeyboardMarkup | None:
+def build_cancel_keyboard(reminders: list[Reminder]) -> InlineKeyboardMarkup | None:
     if not reminders:
         return None
 
-    buttons = [
+    rows = [
         [
             InlineKeyboardButton(
                 text=f"Отменить #{reminder.reminder_id}",
@@ -113,7 +101,46 @@ def build_cancel_keyboard(reminders: list[ReminderRecord]) -> InlineKeyboardMark
         ]
         for reminder in reminders[:10]
     ]
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(rows)
+
+
+def parse_time(value: str) -> time | None:
+    try:
+        return datetime.strptime(value, "%H:%M").time()
+    except ValueError:
+        return None
+
+
+def next_datetime_at(remind_time: time) -> datetime:
+    now = datetime.now(MSK)
+    remind_at = datetime.combine(now.date(), remind_time, tzinfo=MSK)
+    if remind_at <= now:
+        remind_at += timedelta(days=1)
+    return remind_at
+
+
+def format_reminder(reminder: Reminder) -> str:
+    label = "ежедневно" if reminder.is_daily else "один раз"
+    return (
+        f"{reminder.reminder_id}. [{label}] "
+        f"{reminder.remind_at.strftime('%d.%m %H:%M')} МСК - {reminder.text}"
+    )
+
+
+def parse_reminder_args(args: list[str]) -> tuple[str, str] | None:
+    if len(args) < 2:
+        return None
+    return args[0], " ".join(args[1:]).strip()
+
+
+def build_webhook_url(base_url: str, path: str) -> str:
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def build_safe_secret_token(raw_value: str | None, token: str) -> str:
+    candidate = raw_value or f"telegram-bot-{token.split(':', 1)[0]}"
+    sanitized = re.sub(r"[^A-Za-z0-9_-]", "-", candidate).strip("-_")
+    return (sanitized or "telegram-bot-secret")[:256]
 
 
 def build_application(token: str) -> Application:
@@ -180,37 +207,34 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def send_reminder(
+async def schedule_delivery(
     reminder_id: int,
     chat_id: int,
-    delay_seconds: int,
-    text: str,
     remind_at: datetime,
+    text: str,
     is_daily: bool,
     application: Application,
 ) -> None:
     try:
+        delay_seconds = max(0, int((remind_at - datetime.now(MSK)).total_seconds()))
         await asyncio.sleep(delay_seconds)
         await application.bot.send_message(chat_id=chat_id, text=f"Напоминание: {text}")
+
         if is_daily:
             next_remind_at = remind_at + timedelta(days=1)
-            next_delay_seconds = max(
-                0, int((next_remind_at - datetime.now(MSK)).total_seconds())
-            )
             task = application.create_task(
-                send_reminder(
+                schedule_delivery(
                     reminder_id=reminder_id,
                     chat_id=chat_id,
-                    delay_seconds=next_delay_seconds,
-                    text=text,
                     remind_at=next_remind_at,
+                    text=text,
                     is_daily=True,
                     application=application,
                 )
             )
-            register_reminder(
+            save_reminder(
                 application,
-                ReminderRecord(
+                Reminder(
                     reminder_id=reminder_id,
                     chat_id=chat_id,
                     text=text,
@@ -226,15 +250,7 @@ async def send_reminder(
     except Exception:
         logger.exception("Failed to deliver reminder %s for chat %s", reminder_id, chat_id)
     finally:
-        pop_reminder(application, chat_id, reminder_id)
-
-
-def parse_reminder_input(args: list[str]) -> tuple[str, str] | None:
-    if len(args) < 2:
-        return None
-    time_raw = args[0]
-    reminder_text = " ".join(args[1:]).strip()
-    return time_raw, reminder_text
+        remove_reminder(application, chat_id, reminder_id)
 
 
 async def create_reminder(
@@ -246,17 +262,13 @@ async def create_reminder(
     if update.message is None or update.effective_chat is None:
         return
 
-    parsed = parse_reminder_input(context.args)
+    parsed = parse_reminder_args(context.args)
     if parsed is None:
-        command_example = "/daily 08:00 выпить воду" if is_daily else "/remind 08:30 вынести мусор"
-        await update.message.reply_text(
-            "Нужно указать время и текст.\n"
-            f"Пример: {command_example}"
-        )
+        example = "/daily 08:00 выпить воду" if is_daily else "/remind 08:30 вынести мусор"
+        await update.message.reply_text(f"Нужно указать время и текст.\nПример: {example}")
         return
 
     time_raw, reminder_text = parsed
-
     if not reminder_text:
         await update.message.reply_text("Текст напоминания не должен быть пустым.")
         return
@@ -267,36 +279,26 @@ async def create_reminder(
         )
         return
 
-    try:
-        remind_time = datetime.strptime(time_raw, "%H:%M").time()
-    except ValueError:
-        await update.message.reply_text(
-            "Время нужно указать в формате ЧЧ:ММ, например 19:30."
-        )
+    remind_time = parse_time(time_raw)
+    if remind_time is None:
+        await update.message.reply_text("Время нужно указать в формате ЧЧ:ММ, например 19:30.")
         return
 
-    now_msk = datetime.now(MSK)
-    remind_at = datetime.combine(now_msk.date(), remind_time, tzinfo=MSK)
-    if remind_at <= now_msk:
-        remind_at += timedelta(days=1)
-
-    delay_seconds = max(0, int((remind_at - now_msk).total_seconds()))
+    remind_at = next_datetime_at(remind_time)
     reminder_id = next_reminder_id(context.application)
     task = context.application.create_task(
-        send_reminder(
+        schedule_delivery(
             reminder_id=reminder_id,
             chat_id=update.effective_chat.id,
-            delay_seconds=delay_seconds,
-            text=reminder_text,
             remind_at=remind_at,
+            text=reminder_text,
             is_daily=is_daily,
             application=context.application,
         )
     )
-
-    register_reminder(
+    save_reminder(
         context.application,
-        ReminderRecord(
+        Reminder(
             reminder_id=reminder_id,
             chat_id=update.effective_chat.id,
             text=reminder_text,
@@ -309,8 +311,7 @@ async def create_reminder(
     reminder_kind = "каждый день" if is_daily else "один раз"
     await update.message.reply_text(
         f"Готово. Напоминание поставлено: {reminder_kind}.\n"
-        f"Время: {remind_at.strftime('%H:%M')} МСК "
-        f"({remind_at.strftime('%d.%m.%Y')}).\n"
+        f"Время: {remind_at.strftime('%H:%M')} МСК ({remind_at.strftime('%d.%m.%Y')}).\n"
         f"ID: {reminder_id}\n"
         f"Текст: {reminder_text}",
         reply_markup=build_main_keyboard(),
@@ -329,18 +330,12 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.message is None or update.effective_chat is None:
         return
 
-    reminders = list_reminders(context.application, update.effective_chat.id)
+    reminders = get_sorted_reminders(context.application, update.effective_chat.id)
     if not reminders:
         await update.message.reply_text("Активных напоминаний пока нет.")
         return
 
-    lines = ["Активные напоминания:"]
-    for reminder in reminders:
-        label = "ежедневно" if reminder.is_daily else "один раз"
-        lines.append(
-            f"{reminder.reminder_id}. [{label}] {reminder.remind_at.strftime('%d.%m %H:%M')} МСК - {reminder.text}"
-        )
-
+    lines = ["Активные напоминания:"] + [format_reminder(reminder) for reminder in reminders]
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=build_cancel_keyboard(reminders),
@@ -352,10 +347,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if len(context.args) != 1:
-        await update.message.reply_text(
-            "Укажи ID напоминания для отмены.\n"
-            "Пример: /cancel 3"
-        )
+        await update.message.reply_text("Укажи ID напоминания для отмены.\nПример: /cancel 3")
         return
 
     try:
@@ -364,7 +356,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("ID напоминания должен быть числом.")
         return
 
-    reminder = pop_reminder(context.application, update.effective_chat.id, reminder_id)
+    reminder = remove_reminder(context.application, update.effective_chat.id, reminder_id)
     if reminder is None:
         await update.message.reply_text(f"Напоминание с ID {reminder_id} не найдено.")
         return
@@ -389,78 +381,69 @@ async def handle_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Не удалось распознать ID", show_alert=True)
         return
 
-    reminder = pop_reminder(context.application, query.message.chat.id, reminder_id)
+    reminder = remove_reminder(context.application, query.message.chat.id, reminder_id)
     if reminder is None:
         await query.answer("Напоминание уже удалено", show_alert=True)
         return
 
     reminder.task.cancel()
-    await query.edit_message_text(
-        f"Напоминание {reminder_id} отменено.\nТекст: {reminder.text}"
-    )
+    await query.edit_message_text(f"Напоминание {reminder_id} отменено.\nТекст: {reminder.text}")
 
 
 async def cancel_all_reminders(application: Application) -> None:
-    store = get_reminder_store(application)
-    tasks: list[asyncio.Task[None]] = []
+    tasks = [
+        reminder.task
+        for reminders in reminders_store(application).values()
+        for reminder in reminders.values()
+    ]
+    reminders_store(application).clear()
 
-    for chat_reminders in store.values():
-        for reminder in chat_reminders.values():
-            reminder.task.cancel()
-            tasks.append(reminder.task)
-
-    store.clear()
+    for task in tasks:
+        task.cancel()
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def run_polling(application: Application) -> None:
-    logger.info("Bot is running in polling mode")
-    stop_event = create_stop_event()
-
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-
-    try:
-        await stop_event.wait()
-    finally:
-        await cancel_all_reminders(application)
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+async def shutdown(application: Application) -> None:
+    await cancel_all_reminders(application)
+    await application.updater.stop()
+    await application.stop()
+    await application.shutdown()
 
 
-async def run_webhook(
+async def run_application(
     application: Application,
+    *,
+    webhook_base_url: str | None,
     port: int,
     webhook_path: str,
-    webhook_url: str,
     secret_token: str | None,
 ) -> None:
-    logger.info("Bot is running in webhook mode on port %s", port)
-    logger.info("Webhook URL: %s", webhook_url)
     stop_event = create_stop_event()
-
     await application.initialize()
     await application.start()
-    await application.updater.start_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=webhook_path,
-        webhook_url=webhook_url,
-        secret_token=secret_token,
-        drop_pending_updates=True,
-    )
+
+    if webhook_base_url:
+        webhook_url = build_webhook_url(webhook_base_url, webhook_path)
+        logger.info("Bot is running in webhook mode on port %s", port)
+        logger.info("Webhook URL: %s", webhook_url)
+        await application.updater.start_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=webhook_url,
+            secret_token=secret_token,
+            drop_pending_updates=True,
+        )
+    else:
+        logger.info("Bot is running in polling mode")
+        await application.updater.start_polling(drop_pending_updates=True)
 
     try:
         await stop_event.wait()
     finally:
-        await cancel_all_reminders(application)
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+        await shutdown(application)
 
 
 async def main() -> None:
@@ -471,18 +454,14 @@ async def main() -> None:
             "Добавь токен в переменные окружения Render или в код."
         )
 
-    application = build_application(token)
-
     webhook_base_url = get_env("WEBHOOK_URL") or get_env("RENDER_EXTERNAL_URL")
-    if webhook_base_url:
-        port = int(get_env("PORT", "10000"))
-        webhook_path = get_env("TELEGRAM_WEBHOOK_PATH", "telegram")
-        secret_token = build_safe_secret_token(get_env("TELEGRAM_SECRET_TOKEN"), token)
-        webhook_url = build_webhook_url(webhook_base_url, webhook_path)
-        await run_webhook(application, port, webhook_path, webhook_url, secret_token)
-        return
-
-    await run_polling(application)
+    await run_application(
+        build_application(token),
+        webhook_base_url=webhook_base_url,
+        port=int(get_env("PORT", "10000")),
+        webhook_path=get_env("TELEGRAM_WEBHOOK_PATH", "telegram"),
+        secret_token=build_safe_secret_token(get_env("TELEGRAM_SECRET_TOKEN"), token),
+    )
 
 
 if __name__ == "__main__":
